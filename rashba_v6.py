@@ -1,4 +1,4 @@
-import re
+from functools import lru_cache
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -121,6 +121,7 @@ def parse_kpoints(file_path):
     """
     high_symmetry_points = []
     labels = []
+    k_density = None
     try:
         with open(file_path, 'r') as f:
             lines = f.readlines()
@@ -130,7 +131,8 @@ def parse_kpoints(file_path):
                     k_density = int(parts[0])
                 except ValueError:
                     k_density = None
-            for line in lines:
+            # In line-mode KPOINTS the first four lines are header metadata.
+            for line in lines[4:]:
                 stripped = line.strip()
                 if not stripped:
                     continue
@@ -158,6 +160,7 @@ def parse_kpoints(file_path):
 
     return high_symmetry_points, labels, k_density
 
+@lru_cache(maxsize=1)
 def extract_reciprocal_lattice(outcar_file):
     with open(outcar_file, "r") as f:
         lines = f.readlines()
@@ -169,6 +172,22 @@ def extract_reciprocal_lattice(outcar_file):
             b3 = np.array([float(x) for x in lines[i+3].split()[3:6]])
             return b1, b2, b3
 
+    raise ValueError(f"Could not find reciprocal lattice vectors in {outcar_file}.")
+
+def validate_parsed_data(fermi_energy, kpts, bands_data, k_density):
+    if fermi_energy is None:
+        raise ValueError("Could not parse the Fermi energy from OUTCAR.")
+    if not kpts:
+        raise ValueError("No k-points were parsed from OUTCAR.")
+    if not bands_data:
+        raise ValueError("No band energies were parsed from OUTCAR.")
+    if len(kpts) != len(bands_data):
+        raise ValueError(
+            f"Parsed {len(kpts)} k-points but {len(bands_data)} band blocks from OUTCAR."
+        )
+    if k_density is None or k_density < 1:
+        raise ValueError("Could not parse a valid k-point line density from KPOINTS.")
+
 def build_band_arrays(kpoints, bands_data):
     """
     Convert bands_data (list-of-lists) into two NumPy arrays:
@@ -177,6 +196,8 @@ def build_band_arrays(kpoints, bands_data):
     Assumes each k-point has the same max band index.
     """
     nk = len(kpoints)
+    if nk == 0:
+        raise ValueError("No k-points available to build band arrays.")
     max_band_index = max(bd['band'] for k_bands in bands_data for bd in k_bands)
 
     energies = np.full((nk, max_band_index), np.nan)
@@ -195,44 +216,22 @@ def find_vbm_cbm(energies, fermi_energy, kpoints):
     Identify the valence band maximum (VBM) and conduction band minimum (CBM)
     based on their relation to the Fermi energy.
     """
-    vbm = np.max(energies[energies < fermi_energy])
-    cbm = np.min(energies[energies > fermi_energy])
-    
-    vbm_idx = np.where(energies == vbm)
-    cbm_idx = np.where(energies == cbm)
-    vbm_kpoint = vbm_idx[0][0]
-    cbm_kpoint = cbm_idx[0][0]
-    
-    if vbm_kpoint == 0:
-        candidate_vbm = -np.inf
-        candidate_k = None
-        for k in range(1, energies.shape[0]):
-            mask = energies[k, :] < fermi_energy
-            if np.any(mask):
-                current_max = np.max(energies[k, mask])
-                if current_max > candidate_vbm:
-                    candidate_vbm = current_max
-                    candidate_k = k
-        if candidate_k is not None:
-            vbm = candidate_vbm
-            vbm_kpoint = candidate_k
+    below_fermi = np.isfinite(energies) & (energies < fermi_energy)
+    above_fermi = np.isfinite(energies) & (energies > fermi_energy)
 
-    if cbm_kpoint == 0:
-        candidate_cbm = np.inf
-        candidate_k = None
-        for k in range(1, energies.shape[0]):
-            mask = energies[k, :] > fermi_energy
-            if np.any(mask):
-                current_min = np.min(energies[k, mask])
-                if current_min < candidate_cbm:
-                    candidate_cbm = current_min
-                    candidate_k = k
-        if candidate_k is not None:
-            cbm = candidate_cbm
-            cbm_kpoint = candidate_k
+    if not np.any(below_fermi) or not np.any(above_fermi):
+        raise ValueError("Could not identify both valence and conduction states around the Fermi energy.")
 
-    vbm_band = np.where(energies[vbm_kpoint, :] == vbm)[0][0]
-    cbm_band = np.where(energies[cbm_kpoint, :] == cbm)[0][0]
+    valence_energies = np.where(below_fermi, energies, -np.inf)
+    conduction_energies = np.where(above_fermi, energies, np.inf)
+
+    vbm_flat = int(np.argmax(valence_energies))
+    cbm_flat = int(np.argmin(conduction_energies))
+
+    vbm = float(valence_energies.flat[vbm_flat])
+    cbm = float(conduction_energies.flat[cbm_flat])
+    vbm_kpoint, vbm_band = np.unravel_index(vbm_flat, energies.shape)
+    cbm_kpoint, cbm_band = np.unravel_index(cbm_flat, energies.shape)
 
     return vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band
 
@@ -254,6 +253,9 @@ def find_tick_indices(kpts, hs_points, tol=1e-5):
     """
     used = set()
     tick_indices = []
+
+    if not hs_points:
+        return []
 
     for i, gp in enumerate(hs_points):
         if i > 0 and np.allclose(gp, hs_points[i-1], atol=tol):
@@ -278,17 +280,18 @@ def find_tick_indices(kpts, hs_points, tol=1e-5):
         tick_indices.append(idx)
         used.add(idx)
 
-        tick_ind = [tick_indices[0]]
-        for i in range(1, len(tick_indices) - 1, 2):
-            curr = tick_indices[i]
-            nxt  = tick_indices[i + 1]
-            avg = (curr+nxt)/2
-            if curr == nxt:
-                tick_ind.append(curr)
-            else:
-                tick_ind.append(avg)
-        tick_ind.append(tick_indices[len(tick_indices)-1])
-    
+    tick_ind = [tick_indices[0]]
+    for i in range(1, len(tick_indices) - 1, 2):
+        curr = tick_indices[i]
+        nxt = tick_indices[i + 1]
+        avg = (curr + nxt) / 2
+        if curr == nxt:
+            tick_ind.append(curr)
+        else:
+            tick_ind.append(avg)
+    if len(tick_indices) > 1:
+        tick_ind.append(tick_indices[-1])
+
     return tick_ind
 
 
@@ -308,12 +311,32 @@ def find_ticks(hs_labels):
     return tick_labels          
 
 def system_type_check(fermi_energy, energies, kpts):
+    finite_energies = np.where(np.isfinite(energies), energies, np.nan)
+    valid_bands = ~np.all(np.isnan(finite_energies), axis=0)
+    band_mins = np.nanmin(finite_energies[:, valid_bands], axis=0)
+    band_maxs = np.nanmax(finite_energies[:, valid_bands], axis=0)
+    crosses_fermi = (band_mins < fermi_energy) & (band_maxs > fermi_energy)
+    if np.any(crosses_fermi):
+        return 0.0
+
     vbm, cbm, *_ = find_vbm_cbm(energies, fermi_energy, kpts)
-    E_b = cbm - vbm
-    if np.isclose(energies, fermi_energy, rtol=10e-4, atol=10e-5).any():
-        return 0
-    else:
-        return E_b
+    return cbm - vbm
+
+def describe_k_segment(point_idx, tick_ind, tick_labels):
+    if not tick_ind or not tick_labels:
+        return f"k-index {point_idx}"
+
+    if len(tick_ind) == 1:
+        return tick_labels[0]
+
+    tick_positions = np.asarray(tick_ind, dtype=float)
+    insert_idx = int(np.searchsorted(tick_positions, point_idx, side='right'))
+
+    if insert_idx <= 0:
+        return tick_labels[0]
+    if insert_idx >= len(tick_labels):
+        return f"{tick_labels[-2]}->{tick_labels[-1]}"
+    return f"{tick_labels[insert_idx - 1]}->{tick_labels[insert_idx]}"
 
 def plot_band(fermi_energy, energies, kpts, hs_points, hs_labels,k_density):
     
@@ -343,6 +366,9 @@ def plot_band(fermi_energy, energies, kpts, hs_points, hs_labels,k_density):
             elif np.all(energies[:, b] > fermi_energy):  # Conduction bands
                 plt.plot(xvals, energies[:, b], 'deeppink', linewidth=0.8,
                         label='Conduction Band' if b == 0 else "")
+            else:
+                plt.plot(xvals, energies[:, b], 'gray', linewidth=0.8,
+                        label='Crossing Band' if b == 0 else "")
 
         if fermi_energy is not None:
             plt.axhline(y=fermi_energy, color='limegreen', linestyle='--', label='Fermi Energy')
@@ -381,7 +407,7 @@ def find_extrema(fermi_energy, energies, kpts, k_density):
     
     vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
 
-    kpt_range = int(k_density/2)
+    kpt_range = max(1, int(k_density/2))
     kpt_index = cbm_kpoint
     cb_minima_2 = None
     for i in range(-kpt_range, kpt_range + 1):
@@ -433,62 +459,54 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
     if len(cb_minima) == 1:
         cb_start_idx = cb_minima[0]
         k=int(k_density/2)
-        start = cb_start_idx - k
-        end   = cb_start_idx + k
-        band0 = energies[start:end+1, cbm_band]
-        band1 = energies[start:end+1, cbm_band+1]
-        good = np.isclose(band0, band1, atol=tol)
-
-        if np.any(good):
-            masked = band0.copy()
-            masked[~good] = -np.inf
-
-            offset = int(np.argmax(masked))
-        
-        cb_int_pt = start + offset
-        if np.isclose(energies[cb_int_pt, cbm_band],energies[cb_int_pt, cbm_band+1],atol=tol, rtol=0):
-            print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
-
-            int_idx=tick_ind.index(cb_int_pt)
-            
-            dE = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
-            cb_alpha = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE)
-            if cb_int_pt>cb_minima[0]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on CB: {cb_alpha:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on CB: {cb_alpha:.3f}")
-        else:
+        start = max(0, cb_start_idx - k)
+        end = min(energies.shape[0] - 1, cb_start_idx + k)
+        if cbm_band + 1 >= energies.shape[1]:
             print("No Rashba in CB")
+        else:
+            band0 = energies[start:end+1, cbm_band]
+            band1 = energies[start:end+1, cbm_band+1]
+            good = np.isclose(band0, band1, atol=tol)
+
+            if np.any(good):
+                masked = band0.copy()
+                masked[~good] = -np.inf
+
+                offset = int(np.argmax(masked))
+                cb_int_pt = start + offset
+            else:
+                cb_int_pt = None
+
+            if cb_int_pt is not None and np.isclose(energies[cb_int_pt, cbm_band],energies[cb_int_pt, cbm_band+1],atol=tol, rtol=0):
+                print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
+                
+                dE = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
+                cb_alpha = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE)
+                print(f"α ({describe_k_segment(cb_int_pt, tick_ind, tick_labels)}) on CB: {cb_alpha:.3f}")
+            else:
+                print("No Rashba in CB")
 
         
     elif len(cb_minima) == 2:
         cb_start_idx, cb_end_idx = sorted(cb_minima)
-        conduction_range = energies[cb_start_idx:cb_end_idx+1, cbm_band]
-
-        offset = np.argmax(conduction_range)
-        cb_int_pt = cb_start_idx + offset
-        if np.isclose(energies[cb_int_pt, cbm_band],energies[cb_int_pt, cbm_band+1],atol=tol, rtol=0):
-            print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
-            
-            int_idx=tick_ind.index(cb_int_pt)
-            
-            dE1 = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
-            dE2 = energies[cb_int_pt, cbm_band] - energies[cb_minima[1], cbm_band]
-            cb_alpha_1 = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE1)
-            cb_alpha_2 = rashba(kpts[cb_int_pt],kpts[cb_minima[1]],dE2)
-            
-            if cb_int_pt>cb_minima[0]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on CB: {cb_alpha_1:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on CB: {cb_alpha_1:.3f}")
-            
-            
-            if cb_int_pt>cb_minima[1]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on CB: {cb_alpha_2:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on CB: {cb_alpha_2:.3f}")
-        else:
+        if cbm_band + 1 >= energies.shape[1]:
             print("No Rashba in CB")
+        else:
+            conduction_range = energies[cb_start_idx:cb_end_idx+1, cbm_band]
+
+            offset = np.argmax(conduction_range)
+            cb_int_pt = cb_start_idx + offset
+            if np.isclose(energies[cb_int_pt, cbm_band],energies[cb_int_pt, cbm_band+1],atol=tol, rtol=0):
+                print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
+                dE1 = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
+                dE2 = energies[cb_int_pt, cbm_band] - energies[cb_minima[1], cbm_band]
+                cb_alpha_1 = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE1)
+                cb_alpha_2 = rashba(kpts[cb_int_pt],kpts[cb_minima[1]],dE2)
+                segment = describe_k_segment(cb_int_pt, tick_ind, tick_labels)
+                print(f"α ({segment}) on CB: {cb_alpha_1:.3f}")
+                print(f"α ({segment}) on CB: {cb_alpha_2:.3f}")
+            else:
+                print("No Rashba in CB")
     else:
         print("No Rashba in CB")
 
@@ -497,62 +515,54 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
     if len(vb_minima) == 1:
         vb_start_idx = vb_minima[0]
         k=int(k_density/2)
-        start = vb_start_idx - k
-        end   = vb_start_idx + k
-        band0 = energies[start:end+1, vbm_band]
-        band1 = energies[start:end+1, vbm_band-1]
-        good = np.isclose(band0, band1, atol=tol)
-
-        if np.any(good):
-            masked = band0.copy()
-            masked[~good] = -np.inf
-
-            offset = int(np.argmin(masked))
-        
-        vb_int_pt = start + offset 
-        if np.isclose(energies[vb_int_pt, vbm_band],energies[vb_int_pt, vbm_band-1],atol=tol, rtol=0):
-            print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
-
-            int_idx=tick_ind.index(vb_int_pt)
-            
-            dE = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
-            vb_alpha = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE)
-
-            if vb_int_pt>vb_minima[0]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on VB: {vb_alpha:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on VB: {vb_alpha:.3f}")
-        else:
+        start = max(0, vb_start_idx - k)
+        end = min(energies.shape[0] - 1, vb_start_idx + k)
+        if vbm_band - 1 < 0:
             print("No Rashba in VB")
+        else:
+            band0 = energies[start:end+1, vbm_band]
+            band1 = energies[start:end+1, vbm_band-1]
+            good = np.isclose(band0, band1, atol=tol)
+
+            if np.any(good):
+                masked = band0.copy()
+                masked[~good] = np.inf
+
+                offset = int(np.argmin(masked))
+                vb_int_pt = start + offset
+            else:
+                vb_int_pt = None
+
+            if vb_int_pt is not None and np.isclose(energies[vb_int_pt, vbm_band],energies[vb_int_pt, vbm_band-1],atol=tol, rtol=0):
+                print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
+                
+                dE = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
+                vb_alpha = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE)
+                print(f"α ({describe_k_segment(vb_int_pt, tick_ind, tick_labels)}) on VB: {vb_alpha:.3f}")
+            else:
+                print("No Rashba in VB")
             
             
     elif len(vb_minima) == 2:
         vb_start_idx, vb_end_idx = sorted(vb_minima)
-        valence_range = energies[vb_start_idx:vb_end_idx+1, vbm_band]
-
-        offset = np.argmin(valence_range)
-        vb_int_pt = vb_start_idx + offset
-        if np.isclose(energies[vb_int_pt, vbm_band],energies[vb_int_pt, vbm_band-1],atol=tol, rtol=0):
-            print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
-            int_idx=tick_ind.index(vb_int_pt)
-            
-            dE1 = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
-            vb_alpha_1 = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE1)
-            dE2 = energies[vb_minima[1], vbm_band] - energies[vb_int_pt, vbm_band]
-            vb_alpha_2 = rashba(kpts[vb_int_pt],kpts[vb_minima[1]],dE2)
-            
-            if vb_int_pt>vb_minima[0]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on VB: {vb_alpha_1:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on VB: {vb_alpha_1:.3f}")
-            
-            
-            if vb_int_pt>vb_minima[1]:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx-1]}) on VB: {vb_alpha_2:.3f}")
-            else:
-                print(f"α ({tick_labels[int_idx]}→{tick_labels[int_idx+1]}) on VB: {vb_alpha_2:.3f}")
-        else:
+        if vbm_band - 1 < 0:
             print("No Rashba in VB")
+        else:
+            valence_range = energies[vb_start_idx:vb_end_idx+1, vbm_band]
+
+            offset = np.argmin(valence_range)
+            vb_int_pt = vb_start_idx + offset
+            if np.isclose(energies[vb_int_pt, vbm_band],energies[vb_int_pt, vbm_band-1],atol=tol, rtol=0):
+                print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
+                dE1 = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
+                vb_alpha_1 = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE1)
+                dE2 = energies[vb_minima[1], vbm_band] - energies[vb_int_pt, vbm_band]
+                vb_alpha_2 = rashba(kpts[vb_int_pt],kpts[vb_minima[1]],dE2)
+                segment = describe_k_segment(vb_int_pt, tick_ind, tick_labels)
+                print(f"α ({segment}) on VB: {vb_alpha_1:.3f}")
+                print(f"α ({segment}) on VB: {vb_alpha_2:.3f}")
+            else:
+                print("No Rashba in VB")
     else:
         print("No Rashba in VB")
 
@@ -574,31 +584,34 @@ def main():
     hs_points, hs_labels, k_density = parse_kpoints(kpoints_file)
 
     fermi_energy, kpts, bands_data = parse_outcar(outcar_file, hs_points, hs_labels)
+    validate_parsed_data(fermi_energy, kpts, bands_data, k_density)
     print(f"Fermi Energy: {fermi_energy} eV")
     
     energies, occupancies = build_band_arrays(kpts, bands_data)
-    vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
-    E_b=system_type_check(fermi_energy,energies,kpts)
-    print(f"VBM = {vbm:.4f} eV at k-point {kpts[vbm_kpoint]}")
-    print(f"CBM = {cbm:.4f} eV at k-point {kpts[cbm_kpoint]}")
-    print(f"Band gap = {E_b:.4f} eV")
-    print()
+    E_b = system_type_check(fermi_energy, energies, kpts)
 
-    vb_minima, cb_minima = find_extrema(fermi_energy, energies, kpts, k_density)
-    if len(cb_minima)==2:
-        print(f"Minima near the CBM found at k-point indices: {cb_minima}")
-    else:
-        print("No other minima found in the specified range near the CBM.")
-        
-    if len(vb_minima)==2:
-        print(f"Maxima near the VBM found at k-point indices: {vb_minima}")
-    else:
-        print("No other maxima found in the specified range near the VBM.")
-        
-    
-    if E_b==0:
+    if E_b == 0:
+        print("Band gap = 0.0000 eV")
+        print()
         print("System is metallic, no rashba")
     else:
+        vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
+        print(f"VBM = {vbm:.4f} eV at k-point {kpts[vbm_kpoint]}")
+        print(f"CBM = {cbm:.4f} eV at k-point {kpts[cbm_kpoint]}")
+        print(f"Band gap = {E_b:.4f} eV")
+        print()
+
+        vb_minima, cb_minima = find_extrema(fermi_energy, energies, kpts, k_density)
+        if len(cb_minima)==2:
+            print(f"Minima near the CBM found at k-point indices: {cb_minima}")
+        else:
+            print("No other minima found in the specified range near the CBM.")
+            
+        if len(vb_minima)==2:
+            print(f"Maxima near the VBM found at k-point indices: {vb_minima}")
+        else:
+            print("No other maxima found in the specified range near the VBM.")
+        
         find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density)
         
     plot_band(fermi_energy, energies, kpts, hs_points, hs_labels,k_density)
