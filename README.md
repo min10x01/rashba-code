@@ -1,6 +1,6 @@
 # Rashba Parameter Analysis Code
 
-This repository provides Python scripts to calculate the **Rashba spin-splitting parameters** from *ab initio* band structures obtained using **VASP**, **Quantum ESPRESSO**, or similar DFT codes.  
+This repository provides Python scripts to calculate the **Rashba spin-splitting parameters** from *ab initio* band structures obtained using **VASP**.  
 The scripts extract the **Rashba coefficient** ($\alpha_R$), **momentum offset** ($k_0$), and **Rashba energy** ($E_0$) from spin-orbit-coupled band data.
 
 ---
