@@ -1,7 +1,7 @@
 # Rashba Parameter Analysis Code
 
-This repository provides Python scripts to calculate the **Rashba spin-splitting parameters** from *ab initio* band structures obtained using **VASP**.  
-The scripts extract the **Rashba coefficient** ($\alpha_R$), **momentum offset** ($k_0$), and **Rashba energy** ($E_0$) from spin-orbit-coupled band data.
+This repository provides a Python script (`rashba.py`) to calculate the **Rashba spin-splitting parameter** from *ab initio* band structures obtained using **VASP**.
+The script parses a VASP `OUTCAR`/`KPOINTS` pair from a line-mode band-structure calculation and extracts the **Rashba coefficient** ($\alpha_R$) at the spin-splitting points near the valence-band maximum (VBM) and conduction-band minimum (CBM).
 
 ---
 
@@ -9,34 +9,33 @@ The scripts extract the **Rashba coefficient** ($\alpha_R$), **momentum offset**
 
 The **Rashba effect** arises from **spin-orbit coupling (SOC)** in systems lacking inversion symmetry, producing spin-split energy bands near high-symmetry points in the Brillouin zone.
 
-The dispersion relation near the Rashba point can be expressed as
+The Rashba coefficient is estimated as the secant slope between a band extremum and the k-point where the two spin-split branches merge:
 
 $$
-E(k) = E_0 + \frac{\hbar^2 k^2}{2m^*} \pm \alpha_R k
+\alpha_R = \frac{2 \Delta E}{\Delta k}
 $$
 
-where:
-
-- $\alpha_R$ — Rashba parameter (eV·Å)  
-- $k_0$ — momentum offset (Å$^{-1}$)  
-- $E_0$ — Rashba energy (eV)  
-- $m^*$ — effective mass of the charge carrier  
-
-The Rashba coefficient is evaluated as
-
-$$
-\alpha_R = \frac{2E_R}{k_R}
-$$
+where $\Delta E$ is the energy difference between the two points and $\Delta k$ is their separation in reciprocal space, computed from the reciprocal lattice vectors in `OUTCAR`.
 
 ---
 
 ## Features
 
-- Automatic parsing of band-structure outputs from **VASP** or **Quantum ESPRESSO**
-- Extraction of spin-split branches and parabolic fitting near the Rashba point
-- Computation of:
-  - Rashba coefficient ($\alpha_R$)
-  - Momentum offset ($k_0$)
-  - Rashba energy ($E_0$)
-- Optional visualization of Rashba splitting
-- Modular Python structure for easy customization
+- Parsing of VASP `OUTCAR` band energies/occupations and `KPOINTS` (line-mode) high-symmetry points
+- Automatic detection of whether the system is metallic or has a band gap
+- Identification of the VBM, CBM, and band gap
+- Detection of secondary extrema near the VBM/CBM (for Rashba-split bands)
+- Computation of the Rashba coefficient ($\alpha_R$) at detected splitting points on the valence and conduction bands
+- Band structure plot with VBM/CBM/splitting points highlighted (saved to `band_structure.png` if no display is available)
+
+## Requirements
+
+See `requirements.txt` (numpy, matplotlib).
+
+## Usage
+
+Run the script inside a VASP band-structure calculation directory containing `OUTCAR` and `KPOINTS` (line-mode):
+
+```bash
+python rashba.py
+```

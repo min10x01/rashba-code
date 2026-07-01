@@ -1,3 +1,4 @@
+import sys
 from functools import lru_cache
 import numpy as np
 import matplotlib.pyplot as plt
@@ -95,12 +96,13 @@ def parse_outcar(file_path, hs_points, hs_labels):
     merged_kpoints = []
     merged_bands_data = []
     i = 0
-    
+    tol = 1e-5
+
     while i < len(kpoints):
         pt = kpoints[i]
-        if pt in hs_points:
+        if any(np.allclose(pt, hp, atol=tol) for hp in hs_points):
             block = []
-            while i < len(kpoints) and kpoints[i] == pt:
+            while i < len(kpoints) and np.allclose(kpoints[i], pt, atol=tol):
                 block.append(bands_data[i])
                 i += 1
             merged_kpoints.append(pt)
@@ -131,6 +133,11 @@ def parse_kpoints(file_path):
                     k_density = int(parts[0])
                 except ValueError:
                     k_density = None
+            if len(lines) >= 3 and not lines[2].strip()[:1].lower() == 'l':
+                raise ValueError(
+                    f"{file_path} does not look like a line-mode KPOINTS file "
+                    "(line 3 should start with 'L' for Line-mode)."
+                )
             # In line-mode KPOINTS the first four lines are header metadata.
             for line in lines[4:]:
                 stripped = line.strip()
@@ -235,15 +242,15 @@ def find_vbm_cbm(energies, fermi_energy, kpoints):
 
     return vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band
 
-def rashba(i, j, dE):
-    k=i
-    l=j
-    b1, b2, b3 = extract_reciprocal_lattice("OUTCAR")
-    
-    k_cart = (k[0] * b1 + k[1] * b2 + k[2] * b3)
-    l_cart = (l[0] * b1 + l[1] * b2 + l[2] * b3)
+def rashba(i, j, dE, outcar_file="OUTCAR"):
+    b1, b2, b3 = extract_reciprocal_lattice(outcar_file)
+
+    k_cart = (i[0] * b1 + i[1] * b2 + i[2] * b3)
+    l_cart = (j[0] * b1 + j[1] * b2 + j[2] * b3)
     dk = 2*np.pi*np.linalg.norm(k_cart - l_cart)
-    alpha = 2*dE/(dk)
+    if dk == 0:
+        return float('nan')
+    alpha = 2*dE/dk
     return alpha
 
 def find_tick_indices(kpts, hs_points, tol=1e-5):
@@ -401,53 +408,44 @@ def plot_band(fermi_energy, energies, kpts, hs_points, hs_labels,k_density):
     plt.ylabel("Energy (eV)")
     plt.title("Band Structure from OUTCAR")
     #plt.legend()
-    plt.show()
+
+    if 'agg' in plt.get_backend().lower():
+        fallback_path = "band_structure.png"
+        plt.savefig(fallback_path, dpi=150)
+        print(f"Non-interactive backend detected; figure saved to {fallback_path}")
+    else:
+        plt.show()
     
 def find_extrema(fermi_energy, energies, kpts, k_density):
-    
+
     vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
 
     kpt_range = max(1, int(k_density/2))
-    kpt_index = cbm_kpoint
-    cb_minima_2 = None
-    for i in range(-kpt_range, kpt_range + 1):
-        if i == 0:
-            continue
-        idx = kpt_index + i
-        if idx - 1 < 0 or idx + 1 >= energies.shape[0]:
-            continue
-        if (energies[idx, cbm_band] <= energies[idx + 1, cbm_band] and 
-            energies[idx, cbm_band] <= energies[idx - 1, cbm_band]):
-            cb_minima_2 = idx
-    cb_minima_1 = cbm_kpoint
-    cb_minima=[cb_minima_1]
-    if cb_minima_2 is not None:
-        cb_minima.append(cb_minima_2)
-    else:
-        cb_minima = [cb_minima_1]
-    
-    # For Valence Band (VB)
-    kpt_index = vbm_kpoint
-    vb_minima_2 = None
-    for i in range(-kpt_range, kpt_range + 1):
-        if i == 0:
-            continue
-        idx = kpt_index + i
-        if idx - 1 < 0 or idx + 1 >= energies.shape[0]:
-            continue
-        if (energies[idx, vbm_band] > energies[idx + 1, vbm_band] and 
-            energies[idx, vbm_band] > energies[idx - 1, vbm_band]):
-            vb_minima_2 = idx
-    vb_minima_1 = vbm_kpoint
-    vb_minima=[vb_minima_1]
-    if vb_minima_2 is not None:
-        vb_minima.append(vb_minima_2)
-    else:
-        vb_minima = [vb_minima_1]
-    
-    return vb_minima, cb_minima  
 
-def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
+    def nearest_local_extremum(kpt_index, band, find_max):
+        """Scan outward from kpt_index and return the closest strict local extremum."""
+        for dist in range(1, kpt_range + 1):
+            for idx in (kpt_index - dist, kpt_index + dist):
+                if idx - 1 < 0 or idx + 1 >= energies.shape[0]:
+                    continue
+                here = energies[idx, band]
+                if find_max:
+                    if here > energies[idx + 1, band] and here > energies[idx - 1, band]:
+                        return idx
+                else:
+                    if here < energies[idx + 1, band] and here < energies[idx - 1, band]:
+                        return idx
+        return None
+
+    cb_minima_2 = nearest_local_extremum(cbm_kpoint, cbm_band, find_max=False)
+    cb_minima = [cbm_kpoint] if cb_minima_2 is None else [cbm_kpoint, cb_minima_2]
+
+    vb_minima_2 = nearest_local_extremum(vbm_kpoint, vbm_band, find_max=True)
+    vb_minima = [vbm_kpoint] if vb_minima_2 is None else [vbm_kpoint, vb_minima_2]
+
+    return vb_minima, cb_minima
+
+def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density, outcar_file="OUTCAR"):
 
     tol = 1e-4 
     vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
@@ -481,7 +479,7 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
                 print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
                 
                 dE = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
-                cb_alpha = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE)
+                cb_alpha = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE,outcar_file)
                 print(f"α ({describe_k_segment(cb_int_pt, tick_ind, tick_labels)}) on CB: {cb_alpha:.3f}")
             else:
                 print("No Rashba in CB")
@@ -500,8 +498,8 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
                 print(f"Conduction band splitting point is at k-point index {cb_int_pt}({kpts[cb_int_pt]})")
                 dE1 = energies[cb_int_pt, cbm_band] - energies[cb_minima[0], cbm_band]
                 dE2 = energies[cb_int_pt, cbm_band] - energies[cb_minima[1], cbm_band]
-                cb_alpha_1 = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE1)
-                cb_alpha_2 = rashba(kpts[cb_int_pt],kpts[cb_minima[1]],dE2)
+                cb_alpha_1 = rashba(kpts[cb_int_pt],kpts[cb_minima[0]],dE1,outcar_file)
+                cb_alpha_2 = rashba(kpts[cb_int_pt],kpts[cb_minima[1]],dE2,outcar_file)
                 segment = describe_k_segment(cb_int_pt, tick_ind, tick_labels)
                 print(f"α ({segment}) on CB: {cb_alpha_1:.3f}")
                 print(f"α ({segment}) on CB: {cb_alpha_2:.3f}")
@@ -537,7 +535,7 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
                 print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
                 
                 dE = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
-                vb_alpha = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE)
+                vb_alpha = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE,outcar_file)
                 print(f"α ({describe_k_segment(vb_int_pt, tick_ind, tick_labels)}) on VB: {vb_alpha:.3f}")
             else:
                 print("No Rashba in VB")
@@ -555,9 +553,9 @@ def find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density):
             if np.isclose(energies[vb_int_pt, vbm_band],energies[vb_int_pt, vbm_band-1],atol=tol, rtol=0):
                 print(f"Valence band splitting point is at k-point index {vb_int_pt}({kpts[vb_int_pt]})")
                 dE1 = energies[vb_minima[0], vbm_band] - energies[vb_int_pt, vbm_band]
-                vb_alpha_1 = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE1)
+                vb_alpha_1 = rashba(kpts[vb_int_pt],kpts[vb_minima[0]],dE1,outcar_file)
                 dE2 = energies[vb_minima[1], vbm_band] - energies[vb_int_pt, vbm_band]
-                vb_alpha_2 = rashba(kpts[vb_int_pt],kpts[vb_minima[1]],dE2)
+                vb_alpha_2 = rashba(kpts[vb_int_pt],kpts[vb_minima[1]],dE2,outcar_file)
                 segment = describe_k_segment(vb_int_pt, tick_ind, tick_labels)
                 print(f"α ({segment}) on VB: {vb_alpha_1:.3f}")
                 print(f"α ({segment}) on VB: {vb_alpha_2:.3f}")
@@ -581,39 +579,43 @@ def main():
     outcar_file = "OUTCAR"
     kpoints_file = "KPOINTS"
 
-    hs_points, hs_labels, k_density = parse_kpoints(kpoints_file)
+    try:
+        hs_points, hs_labels, k_density = parse_kpoints(kpoints_file)
 
-    fermi_energy, kpts, bands_data = parse_outcar(outcar_file, hs_points, hs_labels)
-    validate_parsed_data(fermi_energy, kpts, bands_data, k_density)
-    print(f"Fermi Energy: {fermi_energy} eV")
-    
-    energies, occupancies = build_band_arrays(kpts, bands_data)
-    E_b = system_type_check(fermi_energy, energies, kpts)
+        fermi_energy, kpts, bands_data = parse_outcar(outcar_file, hs_points, hs_labels)
+        validate_parsed_data(fermi_energy, kpts, bands_data, k_density)
+        print(f"Fermi Energy: {fermi_energy} eV")
 
-    if E_b == 0:
-        print("Band gap = 0.0000 eV")
-        print()
-        print("System is metallic, no rashba")
-    else:
-        vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
-        print(f"VBM = {vbm:.4f} eV at k-point {kpts[vbm_kpoint]}")
-        print(f"CBM = {cbm:.4f} eV at k-point {kpts[cbm_kpoint]}")
-        print(f"Band gap = {E_b:.4f} eV")
-        print()
+        energies, _ = build_band_arrays(kpts, bands_data)
+        E_b = system_type_check(fermi_energy, energies, kpts)
 
-        vb_minima, cb_minima = find_extrema(fermi_energy, energies, kpts, k_density)
-        if len(cb_minima)==2:
-            print(f"Minima near the CBM found at k-point indices: {cb_minima}")
+        if E_b == 0:
+            print("Band gap = 0.0000 eV")
+            print()
+            print("System is metallic, no rashba")
         else:
-            print("No other minima found in the specified range near the CBM.")
-            
-        if len(vb_minima)==2:
-            print(f"Maxima near the VBM found at k-point indices: {vb_minima}")
-        else:
-            print("No other maxima found in the specified range near the VBM.")
-        
-        find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density)
-        
+            vbm, cbm, vbm_kpoint, cbm_kpoint, vbm_band, cbm_band = find_vbm_cbm(energies, fermi_energy, kpts)
+            print(f"VBM = {vbm:.4f} eV at k-point {kpts[vbm_kpoint]}")
+            print(f"CBM = {cbm:.4f} eV at k-point {kpts[cbm_kpoint]}")
+            print(f"Band gap = {E_b:.4f} eV")
+            print()
+
+            vb_minima, cb_minima = find_extrema(fermi_energy, energies, kpts, k_density)
+            if len(cb_minima)==2:
+                print(f"Minima near the CBM found at k-point indices: {cb_minima}")
+            else:
+                print("No other minima found in the specified range near the CBM.")
+
+            if len(vb_minima)==2:
+                print(f"Maxima near the VBM found at k-point indices: {vb_minima}")
+            else:
+                print("No other maxima found in the specified range near the VBM.")
+
+            find_split(fermi_energy, energies, kpts, hs_points, hs_labels, k_density, outcar_file)
+    except (ValueError, OSError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     plot_band(fermi_energy, energies, kpts, hs_points, hs_labels,k_density)
 
 if __name__ == "__main__":
